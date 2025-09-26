@@ -1,44 +1,38 @@
-# motor_controls_gui.py
 """
 Motor GUI + Serial owner + Data queues for plotting
 
 - Talks to ONE device (Feather V2 that runs both: motor control + BLE client).
 - Owns the ONLY serial connection (no other file should open the port).
-- Parses CSV data lines from device: "seq,ms,a26,a25".
+- Parses CSV data lines from device: "seq,ms,ch0,ch2,ch3".
 - Publishes thread-safe queues:
-    data_queue_a0  -> a26 (GPIO26)
-    data_queue_a1  -> a25 (GPIO25)
+    data_queue_a0  -> CH2 volts
+    data_queue_a1  -> CH3 volts
 - Still prints once/second BLE loss summaries from lines like:
     [BLE RX] 99.0% (rx=99, miss=1, exp=100)
 
-Other modules can:
-    from motor_controls_gui import data_queue_a0, data_queue_a1
-and consume the live stream without opening serial again.
+Also logs every sample to experiment_log.csv with:
+    index,timestamp,seq,ms,motor_angle_deg,CH0_volts,CH2_volts,CH3_volts
 """
 
 import tkinter as tk
-import printing
-import time
-import threading
-import re
+import serial, time, threading, re, csv, atexit, os
 from datetime import datetime
 from queue import Queue
 
 # --- External modules (your project) ---
 from helpers import update_tkinter_input_box
-from states import motor_state
+from states import motor_state, file_state
 
 # ===== Config =====
 SERIAL_PORT = '/dev/ttyACM0'
 BAUD = 115200
 
 # ===== Public data queues (import these elsewhere) =====
-# a0 == GPIO26 (A26), a1 == GPIO25 (A25)
-data_queue_a0: Queue[int] = Queue(maxsize=2000)
-data_queue_a1: Queue[int] = Queue(maxsize=2000)
+data_queue_a0: Queue[float] = Queue(maxsize=2000)  # CH2 volts
+data_queue_a1: Queue[float] = Queue(maxsize=2000)  # CH3 volts
 
 # Optional: latest snapshot others can read without touching queues
-latest = {"seq": 0, "ms": 0, "a26": 0, "a25": 0}
+latest = {"seq": 0, "ms": 0, "ch0": 0.0, "ch2": 0.0, "ch3": 0.0}
 
 def _q_put_drop_oldest(q: Queue, item):
     """Non-blocking put; if full, drop one oldest item then insert."""
@@ -62,13 +56,66 @@ BLE_LINE_RE = re.compile(
 # Track degrees if you use 's' markers
 degrees = 0.0
 
+# --- ADC Conversion ---
+def convert_to_voltage(raw, inputRange=4, vREF=4.096):
+    ratio = raw / (1 << 14)
+    if inputRange == 1:
+        return ratio * 3 * vREF / 2 - 1.5 * vREF / 2
+    elif inputRange == 2:
+        return ratio * 3 * vREF / 2 - 3 * vREF / 2
+    elif inputRange == 3:
+        return ratio * 3 * vREF / 2
+    elif inputRange == 4:
+        return ratio * 3 * vREF - 1.5 * vREF
+    elif inputRange == 5:
+        return ratio * 3 * vREF - 3 * vREF
+    elif inputRange == 6:
+        return ratio * 3 * vREF
+    elif inputRange == 7:
+        return ratio * 6 * vREF - 3 * vREF
+    return 0
+
+# --- CSV Setup ---
+import os, csv, atexit
+from states import file_state   # make sure you import file_state
+
+CSV_PATH = None
+csv_file = None
+csv_writer = None
+csv_index = 0
+
+def init_csv():
+    global CSV_PATH, csv_file, csv_writer, csv_index
+    # make base dir
+    os.makedirs(file_state["CURRENT_DIR"], exist_ok=True)
+    # make images subfolder too
+    images_dir = os.path.join(file_state["CURRENT_DIR"], "images")
+    os.makedirs(images_dir, exist_ok=True)
+
+    CSV_PATH = os.path.join(file_state["CURRENT_DIR"], "experiment_log.csv")
+    csv_file = open(CSV_PATH, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow([
+        "index","timestamp","seq","ms","motor_angle_deg",
+        "CH0_volts","CH2_volts","CH3_volts"
+    ])
+    csv_index = 0
+
+def _close_csv():
+    global csv_file
+    if csv_file:
+        csv_file.close()
+
+atexit.register(_close_csv)
+
+
 # --- Serial Connection Setup ---
 try:
-    ser = printing.Serial(SERIAL_PORT, BAUD, timeout=1)
+    ser = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
     time.sleep(2)  # Wait for serial port to initialize
     print(f"[i] Serial connection established on {SERIAL_PORT} @ {BAUD}.")
     print("[i] Expecting BLE summaries like: [BLE RX] 99.0% (rx=99, miss=1, exp=100)")
-except printing.SerialException as e:
+except serial.SerialException as e:
     print(f"Error opening serial port: {e}")
     ser = None
 
@@ -81,7 +128,7 @@ def send_command(command, value=None):
             message = f"{command}\n".encode()
         try:
             ser.write(message)
-        except printing.SerialException as e:
+        except serial.SerialException as e:
             print(f"[!] Serial write error: {e}")
     else:
         print("Serial port not connected.")
@@ -90,11 +137,10 @@ def send_command(command, value=None):
 def serial_listener_thread():
     """
     Reads lines from the Feather and:
-      - Parses BLE summary lines -> prints concise status once per second.
-      - Parses CSV "seq,ms,a26,a25" -> pushes a26/a25 into queues, updates 'latest'.
+      - Parses CSV "seq,ms,ch0,ch2,ch3" -> converts to volts, updates queues, logs CSV.
       - Handles any legacy markers ("PROBE_LOW", "s") without spamming.
     """
-    global degrees, latest
+    global degrees, latest, csv_index
     if not ser:
         return
     print("[i] Starting serial listener thread.")
@@ -107,37 +153,41 @@ def serial_listener_thread():
             if not line:
                 continue
 
-            # # 1) BLE summary line
-            # GOOD ERROR HANDLING AT SOME POINT, BUT DONT NEED RIGHT NOW
-            # m = BLE_LINE_RE.search(line)
-            # if m:
-            #     pct, rx, miss, exp = m.groups()
-            #     ts = datetime.now().isoformat(timespec="seconds")
-            #     print(f"[{ts}] [BLE] SUCCESS={float(pct):5.1f}%  RX={int(rx):3d}  "
-            #           f"MISS={int(miss):3d}  EXP={int(exp):3d}")
-            #     continue
-
-            # 2) CSV sample line: seq,ms,a26,a25
-            #    (Ignore non-CSV lines like headers, probe prints, etc.)
+            # 1) CSV sample line
             if ',' in line and not line.startswith('[') and not line.lower().startswith('seq'):
                 parts = line.split(',')
-                if len(parts) == 4:
+                if len(parts) == 5:
                     try:
-                        seq = int(parts[0], 10)
-                        ms  = int(parts[1], 10)
-                        a26 = int(parts[2], 10)
-                        a25 = int(parts[3], 10)
+                        seq, ms, ch0_raw, ch2_raw, ch3_raw = map(int, parts)
                     except ValueError:
-                        # Not a clean CSV line; skip
-                        pass
-                    else:
-                        latest = {"seq": seq, "ms": ms, "a26": a26, "a25": a25}
-                        _q_put_drop_oldest(data_queue_a0, a26)
-                        _q_put_drop_oldest(data_queue_a1, a25)
-                        # No per-sample printing to keep console quiet
                         continue
 
-            # 3) Handle your existing markers (quietly)
+                    # Convert to volts
+                    ch0_v = convert_to_voltage(ch0_raw, inputRange=4)
+                    ch2_v = convert_to_voltage(ch2_raw, inputRange=4)
+                    ch3_v = convert_to_voltage(ch3_raw, inputRange=4)
+
+                    # Update latest snapshot
+                    latest.update({"seq": seq, "ms": ms,
+                                   "ch0": ch0_v, "ch2": ch2_v, "ch3": ch3_v})
+
+                    # Push CH2/CH3 to queues
+                    _q_put_drop_oldest(data_queue_a0, ch2_v)
+                    _q_put_drop_oldest(data_queue_a1, ch3_v)
+
+                    # Motor angle (from motor_state)
+                    motor_angle = motor_state.get("angle", 0.0)
+
+                    # Write CSV row
+                    ts = time.time()
+                    csv_writer.writerow([
+                        csv_index, ts, seq, ms, motor_angle, ch0_v, ch2_v, ch3_v
+                    ])
+                    csv_file.flush()
+                    csv_index += 1
+                    continue
+
+            # 2) Handle markers
             if line == "PROBE_LOW":
                 print("[EVENT] Probe activated!")
             elif line == "RUNNING":
@@ -145,11 +195,10 @@ def serial_listener_thread():
             elif line == "STOP":
                 motor_state['running'] = False
             else:
-                # Occasional device prints show up here (keep minimal)
-                if line:  # comment this block out for total silence
+                if line:
                     print(f"[DEV] {line}")
 
-        except printing.SerialException as e:
+        except serial.SerialException as e:
             print(f"[!] Serial error: {e}")
             break
         except Exception as e:

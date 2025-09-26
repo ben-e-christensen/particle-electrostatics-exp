@@ -1,6 +1,6 @@
 // Feather ESP32 V2 — BLE Client + Stepper Motor Control + Homing task + Serial bridge
-// - Subscribes to 100 Hz notifications (12 bytes): [u32 seq][u32 ms][u16 a26][u16 a25]
-// - Forwards each sample to USB Serial as CSV: "seq,ms,a26,a25\n"
+// - Subscribes to 100 Hz notifications (14 bytes): [u32 seq][u32 ms][u16 ch0][u16 ch2][u16 ch3]
+// - Forwards each sample to USB Serial as CSV: "seq,ms,ch0,ch2,ch3\n"
 // - Prints once-per-second RX% stats
 // - Serial motor cmds: S (speed), T (toggle dir), X (stop), L (home)
 
@@ -15,11 +15,7 @@
 // ======================== USER CONFIG ========================
 #define STEP_PIN    26
 #define DIR_PIN     25
-#define PROBE_PIN   36  // GPIO36 input-only
-
-const float ADC_VREF = 3.3f;
-const int   ADC_MAX  = 4095;
-const float PROBE_THRESHOLD_V = 1.50f;
+#define PROBE_PIN   14  // digital probe
 
 const int motorInterfaceType = 1;
 AccelStepper stepper(motorInterfaceType, STEP_PIN, DIR_PIN);
@@ -39,16 +35,18 @@ static bool                     gConnected = false;
 struct __attribute__((packed)) Packet {
   uint32_t seq;
   uint32_t ms;
-  uint16_t a26;
-  uint16_t a25;
+  uint16_t ch0;
+  uint16_t ch2;
+  uint16_t ch3;
 };
-static_assert(sizeof(Packet) == 12, "Packet must be 12 bytes");
+static_assert(sizeof(Packet) == 14, "Packet must be 14 bytes");
 
 // Mailbox for latest sample (BLE callback -> main loop)
 volatile uint32_t g_latest_seq = 0;
 volatile uint32_t g_latest_ms  = 0;
-volatile uint16_t g_latest_a26 = 0;
-volatile uint16_t g_latest_a25 = 0;
+volatile uint16_t g_latest_ch0 = 0;
+volatile uint16_t g_latest_ch2 = 0;
+volatile uint16_t g_latest_ch3 = 0;
 volatile bool     g_latest_ready = false;
 
 // RX stats (per-second window)
@@ -78,8 +76,9 @@ void notifyCB(BLERemoteCharacteristic* chr, uint8_t* data, size_t len, bool) {
   // Publish latest (mailbox)
   g_latest_seq  = p.seq;
   g_latest_ms   = p.ms;
-  g_latest_a26  = p.a26;
-  g_latest_a25  = p.a25;
+  g_latest_ch0  = p.ch0;
+  g_latest_ch2  = p.ch2;
+  g_latest_ch3  = p.ch3;
   g_latest_ready = true;
 }
 
@@ -141,9 +140,8 @@ static inline void take_one_step(bool direction) {
   delayMicroseconds(2000);
 }
 
-float read_probe_voltage() {
-  int raw = analogRead(PROBE_PIN);
-  return (raw * ADC_VREF) / float(ADC_MAX);
+bool is_probe_present() {
+  return digitalRead(PROBE_PIN) == LOW;
 }
 
 // =================== HOMING TASK (CORE 0) ===================
@@ -151,7 +149,6 @@ TaskHandle_t homingTaskHandle = nullptr;
 
 void homingTask(void* arg) {
   Serial.printf("[HOMING] Task start on core %d\n", xPortGetCoreID());
-  const float thr = PROBE_THRESHOLD_V;
 
   long steps_taken = 0;
   bool on_mark = false, was_on_mark = false;
@@ -159,15 +156,17 @@ void homingTask(void* arg) {
 
   while (homing) {
     take_one_step(homeDir);
-    float v = read_probe_voltage();
+    on_mark = is_probe_present();
 
-    on_mark = (v >= thr);
     if (on_mark && !was_on_mark) {
       steps_taken = 0;
     } else if (!on_mark && was_on_mark) {
       long steps_to_go_back = max(1L, steps_taken / 2);
       Serial.printf("[HOMING] Mark passed. Backing up %ld steps…\n", steps_to_go_back);
-      for (long i = 0; i < steps_to_go_back && homing; i++) take_one_step(!homeDir);
+      for (long i = 0; i < steps_to_go_back && homing; i++) {
+        take_one_step(!homeDir);
+        vTaskDelay(pdMS_TO_TICKS(1));  // Yield while backing up too
+      }
       stepper.setCurrentPosition(0);
       Serial.println("[HOMING] Complete. Origin set.");
       homing = false;
@@ -176,7 +175,8 @@ void homingTask(void* arg) {
 
     if (on_mark) steps_taken++;
     was_on_mark = on_mark;
-    taskYIELD();
+
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 
   Serial.println("[HOMING] Task exit");
@@ -187,7 +187,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[INIT] Feather ESP32 V2 Client + Motor + Serial bridge");
-  Serial.println("seq,ms,a26,a25"); // CSV header once
+  Serial.println("seq,ms,ch0,ch2,ch3"); // CSV header once
 
   stepper.setMaxSpeed(40000.0);
   stepper.setAcceleration(50000.0);
@@ -199,8 +199,6 @@ void setup() {
   digitalWrite(STEP_PIN, LOW);
 
   pinMode(PROBE_PIN, INPUT);
-  analogSetPinAttenuation(PROBE_PIN, ADC_11db);
-  analogReadResolution(12);
 
   BLEDevice::init("FeatherV2_RX_100Hz");
   BLEScan* scan = BLEDevice::getScan();
@@ -222,32 +220,17 @@ void loop() {
 
   // --- Stream latest sample over Serial (CSV)
   if (g_latest_ready) {
-    // Snapshot and clear flag
     noInterrupts();
     uint32_t seq = g_latest_seq, ms = g_latest_ms;
-    uint16_t a26 = g_latest_a26, a25 = g_latest_a25;
+    uint16_t ch0 = g_latest_ch0, ch2 = g_latest_ch2, ch3 = g_latest_ch3;
     g_latest_ready = false;
     interrupts();
 
-    // CSV line
-    Serial.printf("%lu,%lu,%u,%u\n",
-                  (unsigned long)seq, (unsigned long)ms, a26, a25);
+    Serial.printf("%lu,%lu,%u,%u,%u\n",
+                  (unsigned long)seq, (unsigned long)ms, ch0, ch2, ch3);
   }
 
-  // --- Once per second: print RX% stats (to Serial monitor; harmless for parser since not CSV)
-  // static uint32_t last_print_ms = 0;
-  // if (now - last_print_ms >= 1000) {
-  //   last_print_ms = now;
-  //   noInterrupts();
-  //   uint32_t rx = g_rx_in_window, miss = g_miss_in_window;
-  //   g_rx_in_window = 0; g_miss_in_window = 0; g_have_prev = false;
-  //   interrupts();
-  //   uint32_t exp = rx + miss;
-  //   float pct = exp ? (100.0f * rx / exp) : 0.0f;
-  //   Serial.printf("[BLE RX] %.1f%% (rx=%u, miss=%u, exp=%u)\n", pct, rx, miss, exp);
-  // }
-
-  // --- Serial motor commands
+  // --- Serial motor commands (same as before)
   if (!homing && Serial.available() > 0) {
     command = Serial.read();
     if (command == 'S') {
@@ -268,28 +251,21 @@ void loop() {
         xTaskCreatePinnedToCore(homingTask, "homingTask", 4096, nullptr, 2, &homingTaskHandle, 0);
       }
     }
-
   }
 
-  uint32_t now = millis();
   // --- Run motor
+  uint32_t now = millis();
   if (running && !homing){
     stepper.runSpeed();
     static uint32_t last_probe_ms = 0;
     if (now - last_probe_ms >= 500) {
       last_probe_ms = now;
-      float v = read_probe_voltage();
-      // Serial.printf("[PROBE] %.3f V\n", v);
       long pos = stepper.currentPosition();
       float stepsPerRev = 6400.0;
-
       float degrees = fmod(pos, stepsPerRev) * (360.0 / stepsPerRev);
-
       Serial.println(degrees);
     }
   } else {
     vTaskDelay(pdMS_TO_TICKS(2));
   }
-
-  
 }

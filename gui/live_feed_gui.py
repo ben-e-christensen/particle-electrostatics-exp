@@ -1,4 +1,3 @@
-# gui/live_feed_gui.py
 """
 Live feed plotting window (attaches to existing Tk root)
 
@@ -19,7 +18,7 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-# ⚠️ Make sure this import path matches your project structure exactly.
+# Make sure this import path matches your project structure exactly.
 # Both main.py and this file must import the SAME module object.
 from gui.motor_controls_gui import data_queue_a0, data_queue_a1
 
@@ -29,8 +28,8 @@ DRAIN_CAP_PER_FRAME = 200   # max pairs drained per UI tick
 UI_REFRESH_MS = 16          # ~60 fps
 
 # -------------------- Plotting State ------------------
-data_buffer_a0 = deque(maxlen=BUFFER_SIZE)
-data_buffer_a1 = deque(maxlen=BUFFER_SIZE)
+data_buffer_a0 = deque(maxlen=BUFFER_SIZE)  # CH2 volts
+data_buffer_a1 = deque(maxlen=BUFFER_SIZE)  # CH3 volts
 sample_idx = 0  # monotonically increasing x counter
 
 # -------------------- Window Builder ------------------
@@ -43,17 +42,17 @@ def _build_live_feed_window(parent):
     fig, ax = plt.subplots(1, 2, figsize=(10, 5))
     fig.suptitle("Live Data Stream", fontsize=16)
 
-    # Left subplot (A26 / GPIO26)
-    ax[0].set_title("GPIO26 (A26)")
+    # Left subplot (CH2)
+    ax[0].set_title("CH2")
     ax[0].set_xlabel("Sample Index")
-    ax[0].set_ylabel("Sensor Value")
+    ax[0].set_ylabel("Voltage (V)")
     ax[0].grid(True)
     line_a0, = ax[0].plot([], [], 'r-')
 
-    # Right subplot (A25 / GPIO25)
-    ax[1].set_title("GPIO25 (A25)")
+    # Right subplot (CH3)
+    ax[1].set_title("CH3")
     ax[1].set_xlabel("Sample Index")
-    ax[1].set_ylabel("Sensor Value")
+    ax[1].set_ylabel("Voltage (V)")
     ax[1].grid(True)
     line_a1, = ax[1].plot([], [], '#87CEEB')
 
@@ -66,7 +65,7 @@ def _build_live_feed_window(parent):
     # Heartbeat: show queue sizes in the window title (quick sanity check)
     def heartbeat():
         try:
-            top.title(f"Live Feed  |  q0={data_queue_a0.qsize()}  q1={data_queue_a1.qsize()}")
+            top.title(f"Live Feed  |  CH2_q={data_queue_a0.qsize()}  CH3_q={data_queue_a1.qsize()}")
         finally:
             top.after(250, heartbeat)
 
@@ -91,7 +90,7 @@ def _build_live_feed_window(parent):
                 # Build x for the current visible window
                 n = len(data_buffer_a0)  # == len(data_buffer_a1)
                 x_start = max(0, sample_idx - n)
-                x_vals = list(range(x_start, x_start + n))  # list for backend compatibility
+                x_vals = list(range(x_start, x_start + n))
 
                 # Update line data
                 line_a0.set_xdata(x_vals)
@@ -109,15 +108,14 @@ def _build_live_feed_window(parent):
                 if n > 0:
                     ymin0, ymax0 = min(data_buffer_a0), max(data_buffer_a0)
                     ymin1, ymax1 = min(data_buffer_a1), max(data_buffer_a1)
-                    pad0 = max(1, int(0.05 * (ymax0 - ymin0 + 1)))
-                    pad1 = max(1, int(0.05 * (ymax1 - ymin1 + 1)))
+                    pad0 = max(0.05, 0.05 * (ymax0 - ymin0 + 1))
+                    pad1 = max(0.05, 0.05 * (ymax1 - ymin1 + 1))
                     ax[0].set_ylim(ymin0 - pad0, ymax0 + pad0)
                     ax[1].set_ylim(ymin1 - pad1, ymax1 + pad1)
 
                 canvas.draw_idle()
 
         except Exception:
-            # Do not silently die; print the traceback to the console
             print("[live_feed_gui] update_plot error:")
             traceback.print_exc()
 

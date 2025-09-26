@@ -7,3 +7,4 @@ micropython-tools
 *.gbrjob
 ~*.lck
 *.kicad_prl
+.venv

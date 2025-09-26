@@ -1,7 +1,7 @@
 import serial
 
 # ---- Edit this section for your setup ----
-PORT = "/dev/ttyACM0"   # e.g. Linux: /dev/ttyACM0, Windows: "COM3", macOS: "/dev/cu.usbmodemXXX"
+PORT = "/dev/ttyACM1"   # e.g. Linux: /dev/ttyACM0, Windows: "COM3", macOS: "/dev/cu.usbmodemXXX"
 BAUD = 115200           # must match Serial.begin() in your Arduino code
 
 # ------------------------------------------

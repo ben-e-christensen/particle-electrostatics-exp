@@ -1,118 +1,145 @@
+"""
+Live feed plotting window (attaches to existing Tk root)
+
+- Imports data queues from motor_controls_gui (single serial owner).
+- Uses deques for rolling Y-buffers and a monotonically increasing X index
+  so the plot side-scrolls smoothly past the visible window.
+- attach_live_feed(parent=...) creates a Toplevel inside your main app.
+- If run directly (python live_feed_gui.py), it creates its own root and runs standalone.
+"""
+
 import tkinter as tk
-from tkinter import TclError
-from PIL import Image, ImageTk
-import threading
+from collections import deque
+from queue import Empty
+import traceback
+
+import matplotlib
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import numpy as np
-import time
-from queue import Queue
-import cv2
 
-# Import the shared queues and stop_event from the BLE module
-from BLE.client.ble_plotter import data_queue_a0, data_queue_a1, stop_event
+# Make sure this import path matches your project structure exactly.
+# Both main.py and this file must import the SAME module object.
+from gui.motor_controls_gui import data_queue_a0, data_queue_a1
 
-# --- PLOTTING Globals ---
-data_buffer_a0 = []
-data_buffer_a1 = []
-time_buffer = []
-buffer_size = 500  # Number of data points to display
+# ----------------------- Config -----------------------
+BUFFER_SIZE = 500           # how many points visible
+DRAIN_CAP_PER_FRAME = 200   # max pairs drained per UI tick
+UI_REFRESH_MS = 16          # ~60 fps
 
-# --- VIDEO Globals ---
-video_queue = Queue()
-video_label = None
-tk_img = None # A global reference to prevent garbage collection
-DISPLAY_W, DISPLAY_H = 640, 480
+# -------------------- Plotting State ------------------
+data_buffer_a0 = deque(maxlen=BUFFER_SIZE)  # CH2 volts
+data_buffer_a1 = deque(maxlen=BUFFER_SIZE)  # CH3 volts
+sample_idx = 0  # monotonically increasing x counter
 
-# --- Matplotlib and Tkinter Setup ---
-fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-fig.suptitle("Live Data Stream from BLE Device", fontsize=16)
+# -------------------- Window Builder ------------------
+def _build_live_feed_window(parent):
+    """Create the live feed plotting window as a Toplevel attached to 'parent'."""
+    top = tk.Toplevel(parent)
+    top.title("Live Feed")
 
-# First subplot (A0 data)
-ax[0].set_title("Analog Channel 0")
-ax[0].set_xlabel("Data Point Index")
-ax[0].set_ylabel("Sensor Value")
-ax[0].grid(True)
-line_a0, = ax[0].plot([], [], 'r-')
+    # Matplotlib figure & axes
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+    fig.suptitle("Live Data Stream", fontsize=16)
 
-# Second subplot (A1 data)
-ax[1].set_title("Analog Channel 1")
-ax[1].set_xlabel("Data Point Index")
-ax[1].set_ylabel("Sensor Value")
-ax[1].grid(True)
-line_a1, = ax[1].plot([], [], color='#87CEEB')
+    # Left subplot (CH2)
+    ax[0].set_title("CH2")
+    ax[0].set_xlabel("Sample Index")
+    ax[0].set_ylabel("Voltage (V)")
+    ax[0].grid(True)
+    line_a0, = ax[0].plot([], [], 'r-')
 
-def update_plot():
+    # Right subplot (CH3)
+    ax[1].set_title("CH3")
+    ax[1].set_xlabel("Sample Index")
+    ax[1].set_ylabel("Voltage (V)")
+    ax[1].grid(True)
+    line_a1, = ax[1].plot([], [], '#87CEEB')
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    canvas = FigureCanvasTkAgg(fig, master=top)
+    canvas_widget = canvas.get_tk_widget()
+    canvas_widget.pack(fill=tk.BOTH, expand=True)
+
+    # Heartbeat: show queue sizes in the window title (quick sanity check)
+    def heartbeat():
+        try:
+            top.title(f"Live Feed  |  CH2_q={data_queue_a0.qsize()}  CH3_q={data_queue_a1.qsize()}")
+        finally:
+            top.after(250, heartbeat)
+
+    def update_plot():
+        global sample_idx
+        try:
+            # Drain paired samples (keep queues in lockstep)
+            n_pairs = min(data_queue_a0.qsize(), data_queue_a1.qsize())
+            n_pairs = min(n_pairs, DRAIN_CAP_PER_FRAME)
+
+            if n_pairs > 0:
+                for _ in range(n_pairs):
+                    try:
+                        a0 = data_queue_a0.get_nowait()
+                        a1 = data_queue_a1.get_nowait()
+                    except Empty:
+                        break
+                    data_buffer_a0.append(a0)
+                    data_buffer_a1.append(a1)
+                    sample_idx += 1
+
+                # Build x for the current visible window
+                n = len(data_buffer_a0)  # == len(data_buffer_a1)
+                x_start = max(0, sample_idx - n)
+                x_vals = list(range(x_start, x_start + n))
+
+                # Update line data
+                line_a0.set_xdata(x_vals)
+                line_a0.set_ydata(list(data_buffer_a0))
+                line_a1.set_xdata(x_vals)
+                line_a1.set_ydata(list(data_buffer_a1))
+
+                # Scroll x-axis with data
+                x_left  = max(0, sample_idx - BUFFER_SIZE)
+                x_right = max(BUFFER_SIZE, sample_idx)
+                ax[0].set_xlim(x_left, x_right)
+                ax[1].set_xlim(x_left, x_right)
+
+                # Autoscale Y with padding
+                if n > 0:
+                    ymin0, ymax0 = min(data_buffer_a0), max(data_buffer_a0)
+                    ymin1, ymax1 = min(data_buffer_a1), max(data_buffer_a1)
+                    pad0 = max(0.05, 0.05 * (ymax0 - ymin0 + 1))
+                    pad1 = max(0.05, 0.05 * (ymax1 - ymin1 + 1))
+                    ax[0].set_ylim(ymin0 - pad0, ymax0 + pad0)
+                    ax[1].set_ylim(ymin1 - pad1, ymax1 + pad1)
+
+                canvas.draw_idle()
+
+        except Exception:
+            print("[live_feed_gui] update_plot error:")
+            traceback.print_exc()
+
+        finally:
+            top.after(UI_REFRESH_MS, update_plot)
+
+    top.after(250, heartbeat)
+    top.after(UI_REFRESH_MS, update_plot)
+    return top
+
+# -------------------- Public API ----------------------
+def attach_live_feed(parent: tk.Misc | None = None):
     """
-    Checks the queues for new data and updates both Matplotlib plots.
+    Attach the live feed window to an existing Tk root if present,
+    otherwise create a root and run standalone.
     """
-    new_data_count = 0
-    while not data_queue_a0.empty() and not data_queue_a1.empty():
-        data_point_a0 = data_queue_a0.get()
-        data_point_a1 = data_queue_a1.get()
-        
-        data_buffer_a0.append(data_point_a0)
-        data_buffer_a1.append(data_point_a1)
-        time_buffer.append(len(time_buffer))
-        new_data_count += 1
+    root = parent or tk._get_default_root()
+    if root is None:
+        root = tk.Tk()
+        _build_live_feed_window(root)
+        root.mainloop()
+    else:
+        _build_live_feed_window(root)
 
-    if new_data_count > 0:
-        if len(data_buffer_a0) > buffer_size:
-            data_buffer_a0[:] = data_buffer_a0[-buffer_size:]
-            data_buffer_a1[:] = data_buffer_a1[-buffer_size:]
-            time_buffer[:] = list(range(len(data_buffer_a0)))
-
-        line_a0.set_xdata(time_buffer)
-        line_a0.set_ydata(data_buffer_a0)
-        line_a1.set_xdata(time_buffer)
-        line_a1.set_ydata(data_buffer_a1)
-
-        ax[0].set_xlim(0, buffer_size)
-        ax[1].set_xlim(0, buffer_size)
-        if data_buffer_a0:
-            ax[0].set_ylim(min(data_buffer_a0) - 50, max(data_buffer_a0) + 50)
-            ax[1].set_ylim(min(data_buffer_a1) - 50, max(data_buffer_a1) + 50)
-        
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
-        canvas.draw_idle()
-
-    root.after(50, update_plot)
-
-def update_video():
-    """Checks the video queue and updates the video label with a new frame (resized)."""
-    global tk_img
-    if not video_queue.empty():
-        pil_img = None
-        # Drain queue so we always show the most recent frame
-        while not video_queue.empty():
-            pil_img = video_queue.get_nowait()
-
-        if pil_img is not None:
-            # Resize to fixed dimensions
-            pil_img = pil_img.resize((DISPLAY_W, DISPLAY_H), Image.Resampling.LANCZOS)
-            tk_img = ImageTk.PhotoImage(pil_img, master=video_label)
-            video_label.configure(image=tk_img)
-            video_label.image = tk_img  # keep ref
-
-    root.after(15, update_video)
-
-
-# Main control window
-root = tk.Tk()
-root.title("Live Data & Camera Feed")
-
-# Widgets for the data window
-canvas = FigureCanvasTkAgg(fig, master=root)
-canvas_widget = canvas.get_tk_widget()
-canvas_widget.pack(fill=tk.BOTH, expand=True)
-
-video_label = tk.Label(root)
-video_label.pack()
-
-def run_gui():
-    root.after(50, update_plot)
-    root.after(15, update_video)
-    root.mainloop()
-
+# -------------------- Standalone ----------------------
 if __name__ == "__main__":
-    run_gui()
+    attach_live_feed(None)

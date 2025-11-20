@@ -9,7 +9,6 @@ from gui.live_feed_gui import attach_live_feed
 from gui.camera_feed_gui import attach_camera_feed
 
 # Option B: camera + plots in one window
-from gui.unified_feed_gui import attach_unified_feed
 from gui import motor_controls_gui
 
 today = time.strftime("%Y-%m-%d_%H_%M", time.localtime())

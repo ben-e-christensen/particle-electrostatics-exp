@@ -1,5 +1,6 @@
-from machine import SPI, Pin, Timer
+from machine import SPI, Pin, Timer, ADC
 import time, struct, bluetooth
+import _thread
 
 print("=== Feather V2 ADC + BLE Debug ===")
 
@@ -123,6 +124,21 @@ def advertise():
 advertise()
 
 # ======================================================
+# === BATTERY MONITORING ===
+# ======================================================
+vbat_pin = Pin(35)
+        
+batt_voltage = ADC(vbat_pin)     
+
+# Set attenuation so it can measure up to 3.3 V
+batt_voltage.atten(ADC.ATTN_11DB)   # Full 0-3.3V range
+
+def read_vbat():
+    raw = batt_voltage.read()                       # 0–4095 on ESP32 (12-bit)
+    measured = raw * (3.3 / 4095.0)        # Convert to voltage at pin
+    return measured * 2.0     
+
+# ======================================================
 # === MAIN LOOP / TIMER CALLBACK ===
 # ======================================================
 seq = 0
@@ -153,13 +169,30 @@ def send_packet(timer):
         pkt = struct.pack("<IIHH", seq, ms, ch2, ch3)  # [seq][ms][ch2][ch3]
         try:
             ble.gatts_notify(0, adc_handle, pkt)
-            print("[BLE] Notify seq={} ms={} ch2={} ch3={}".format(seq, ms, ch2, ch3))
+            # print("[BLE] Notify seq={} ms={} ch2={} ch3={}".format(seq, ms, ch2, ch3))
         except OSError as e:
             # -128 = not ready / unsubscribed yet
             print("[BLE] Notify failed (seq={}, err={})".format(seq, e))
 
 
     seq += 1
+
+
+led = Pin(13, Pin.OUT)   # adjust if needed, sometimes Pin(2) is the LED
+
+def led_thread():
+    while True:
+        vbat = read_vbat()
+        if vbat > 3.5:
+            led.value(1)   # LED on
+            time.sleep(0.5)
+            led.value(0)   # LED off
+        # wait remaining time of 5s period
+        time.sleep(4.5)
+
+# start the LED blink thread
+
+
 
 if DEBUG:
     print("[MODE] Debug print mode")
@@ -169,4 +202,6 @@ if DEBUG:
 else:
     print("[MODE] BLE streaming at 100 Hz")
     tim = Timer(0)
+    print("Starting LED monitoring thread...")
+    _thread.start_new_thread(led_thread, ())
     tim.init(freq=100, mode=Timer.PERIODIC, callback=send_packet)

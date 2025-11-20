@@ -21,7 +21,7 @@ from queue import Queue
 
 # --- External modules (your project) ---
 from helpers import update_tkinter_input_box
-from states import motor_state, file_state
+from states import motor_state, file_state, ellipse_state, frame_state
 
 # ===== Config =====
 SERIAL_PORT = '/dev/ttyACM0'
@@ -56,6 +56,18 @@ BLE_LINE_RE = re.compile(
 # Track degrees if you use 's' markers
 degrees = 0.0
 
+v_state = {
+    'ch2_prev': 0,
+    'ch3_prev': 0,
+    'record': False
+}
+derivatives = {
+    'ch2': 0,
+    'ch3': 0,
+    'threshold': 1,
+    'ch2_flag': False,
+    'ch3_flag': False,
+}
 # --- ADC Conversion ---
 def convert_to_voltage(raw, inputRange=4, vREF=4.096):
     ratio = raw / (1 << 14)
@@ -96,9 +108,12 @@ def init_csv():
     csv_file = open(CSV_PATH, "w", newline="")
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow([
-        "index","timestamp","seq","ms","motor_angle_deg",
-        "CH0_volts","CH2_volts","CH3_volts"
+        "index","timestamp","seq","ms","motor_angle_deg", "motor_speed",
+        "CH0_volts","CH2_volts","CH3_volts",
+        "ellipse_angle_deg", "ellipse_area_px2", "frame_name",
+        "ch2_dv/dt", 'ch3_dv/dt', 'ch2_flag', 'ch3_flag'
     ])
+
     csv_index = 0
 
 def _close_csv():
@@ -114,7 +129,7 @@ try:
     ser = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
     time.sleep(2)  # Wait for serial port to initialize
     print(f"[i] Serial connection established on {SERIAL_PORT} @ {BAUD}.")
-    print("[i] Expecting BLE summaries like: [BLE RX] 99.0% (rx=99, miss=1, exp=100)")
+    # print("[i] Expecting BLE summaries like: [BLE RX] 99.0% (rx=99, miss=1, exp=100)")
 except serial.SerialException as e:
     print(f"Error opening serial port: {e}")
     ser = None
@@ -163,10 +178,23 @@ def serial_listener_thread():
                         continue
 
                     # Convert to volts
-                    ch0_v = convert_to_voltage(ch0_raw, inputRange=4)
-                    ch2_v = convert_to_voltage(ch2_raw, inputRange=4)
-                    ch3_v = convert_to_voltage(ch3_raw, inputRange=4)
+                    ch0_v = convert_to_voltage(ch0_raw, inputRange=1)
+                    ch2_v = convert_to_voltage(ch2_raw, inputRange=1)
+                    ch3_v = convert_to_voltage(ch3_raw, inputRange=1)
 
+                    if v_state['record']:
+                    # compute derivatives
+                        for ch, current_v in (("ch2", ch2_v), ("ch3", ch3_v)):
+                            prev_key = f"{ch}_prev"
+                            dv = (current_v - v_state[prev_key]) / 0.01  # 100 Hz → dt = 0.01 s
+                            derivatives[ch] = dv
+                            derivatives[f"{ch}_flag"] = dv > derivatives["threshold"]
+                            # update previous value
+                            v_state[prev_key] = current_v
+                        
+                    else:
+                        v_state['record'] = True
+                    
                     # Update latest snapshot
                     latest.update({"seq": seq, "ms": ms,
                                    "ch0": ch0_v, "ch2": ch2_v, "ch3": ch3_v})
@@ -177,15 +205,26 @@ def serial_listener_thread():
 
                     # Motor angle (from motor_state)
                     motor_angle = motor_state.get("angle", 0.0)
-
+                    angle = ellipse_state.get("angle_deg")
+                    area  = ellipse_state.get("area_px2")
                     # Write CSV row
-                    ts = time.time()
-                    csv_writer.writerow([
-                        csv_index, ts, seq, ms, motor_angle, ch0_v, ch2_v, ch3_v
-                    ])
-                    csv_file.flush()
-                    csv_index += 1
-                    continue
+                    
+                    if motor_state['running']:
+                        ts = time.time()
+                        "ch2_dv/dt", 'ch3_dv/dt', 'flag'
+                        csv_writer.writerow([
+                            csv_index, ts, seq, ms, motor_angle, motor_state['rpm'],
+                            f"{ch0_v:.6f}", f"{ch2_v:.6f}", f"{ch3_v:.6f}",
+                            round(angle, 2) if angle is not None else "",
+                            round(area, 1) if area is not None else "",
+                            frame_state['name'], f"{derivatives['ch2']:.6f}", f"{derivatives['ch3']:.6f}",
+                            derivatives['ch2_flag'], derivatives['ch3_flag']
+                        ])
+
+                        csv_file.flush()
+                        csv_index += 1
+                        continue
+
 
             # 2) Handle markers
             if line == "PROBE_LOW":
@@ -194,9 +233,6 @@ def serial_listener_thread():
                 motor_state['running'] = True
             elif line == "STOP":
                 motor_state['running'] = False
-            else:
-                if line:
-                    print(f"[DEV] {line}")
 
         except serial.SerialException as e:
             print(f"[!] Serial error: {e}")
@@ -276,6 +312,36 @@ def handle_enter(event=None):
     send_command('S', int(sps_value))
     update_gui_state()
 
+def auto_ramp_sequence():
+    """Automatically ramps RPM up and down in 5-RPM steps with 1-minute holds."""
+    if not ser:
+        print("[!] No serial connection available.")
+        return
+
+    ramp_steps = [1, 6, 11, 16, 21, 26, 26, 21, 16, 11, 6, 1]
+    motor_state['running'] = True
+    print("[AUTO] Starting auto ramp sequence...")
+
+    for rpm in ramp_steps:
+        motor_state['rpm'] = rpm
+        update_tkinter_input_box(freq, rpm)
+        sps_value = (rpm / 60.0) * motor_state['spr']
+        send_command('S', int(sps_value))
+        update_gui_state()
+        print(f"[AUTO] Holding {rpm} RPM for 60s...")
+        for _ in range(300):
+            if not motor_state['running']:
+                print("[AUTO] Sequence interrupted.")
+                send_command('X')
+                return
+            time.sleep(1)
+
+    print("[AUTO] Sequence complete. Stopping motor.")
+    send_command('X')
+    motor_state['running'] = False
+
+
+
 # --- GUI Creation ---
 root = tk.Tk()
 root.title("Motor Control & BLE Monitor")
@@ -303,6 +369,8 @@ revs_label = tk.Label(root, text="Enter total revolutions:")
 total_revs = tk.Entry(root, width=30)
 checkbox = tk.Checkbutton(root, text="Run motor until stopped", variable=checkbox_val, onvalue=1, offvalue=0)
 input_button = tk.Button(root, text="Apply Speed", command=handle_enter)
+auto_ramp_button = tk.Button(root, text="Auto RPM Ramp", command=lambda: threading.Thread(target=auto_ramp_sequence, daemon=True).start())
+
 
 # Set initial values for entry widgets
 update_tkinter_input_box(freq, motor_state['rpm'])
@@ -311,10 +379,11 @@ update_gui_state()
 
 # Pack widgets
 for w in [start_button, stop_button, reverse_button, speed_up_button,
-          slow_down_button, homing_button,
+          slow_down_button, homing_button, auto_ramp_button,
           inc_label, inc, freq_label, freq, revs_label, total_revs,
           checkbox, input_button, result_label]:
     w.pack(pady=5)
+
 
 # Bind keys to functions
 root.bind("<Return>", handle_enter)

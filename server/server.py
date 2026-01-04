@@ -6,7 +6,11 @@ print("=== Feather V2 ADC + BLE Debug ===")
 
 """
 source ~/esp32env/bin/activate
-mpremote connect /dev/ttyACM1 fs cp server.py :main.py
+mpremote connect /dev/ttyUSB0 fs cp server.py :main.py
+
+to flash: 
+esptool.py --chip esp32 --port /dev/ttyUSB0 erase_flash
+esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 115200 write_flash -z 0x1000 ESP32_GENERIC-20250911-v1.26.1.bin
 """
 
 # ======================================================
@@ -18,7 +22,7 @@ inputRange = 4    # Keep your conditional ranges intact
 
 # SPI Setup
 spi = SPI(1, baudrate=100000, polarity=0, phase=0,
-          sck=Pin(5), mosi=Pin(19), miso=Pin(21))
+          sck=Pin(5), mosi=Pin(18), miso=Pin(19))
 cs = Pin(25, Pin.OUT)
 cs.value(1)
 

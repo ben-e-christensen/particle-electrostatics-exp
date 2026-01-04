@@ -366,7 +366,7 @@ def auto_ramp_sequence():
         sps_value = (rpm / 60.0) * motor_state['spr']
         send_command('S', int(sps_value))
         update_gui_state()
-        bracket = 60
+        bracket = 1500
         print(f"[AUTO] Holding {rpm} RPM for {bracket} seconds...")
         for _ in range(bracket):
             if not motor_state['running']:

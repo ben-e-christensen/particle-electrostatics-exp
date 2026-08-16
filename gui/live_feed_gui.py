@@ -79,7 +79,7 @@ def _build_live_feed_window(parent):
             if n_pairs > 0:
                 for _ in range(n_pairs):
                     try:
-                        a0 = data_queue_a0.get_nowait()
+                        a0 = -data_queue_a0.get_nowait()
                         a1 = data_queue_a1.get_nowait()
                     except Empty:
                         break

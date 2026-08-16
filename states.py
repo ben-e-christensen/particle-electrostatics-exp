@@ -15,7 +15,7 @@ motor_state = {
 }
 
 file_state = {
-    "BASE_DIR": "/media/ben/SANDISK/particle-electrostatics-exp",
+    "BASE_DIR": "/home/ben/Desktop",
     "CURRENT_DIR": "",
     "index": -1
 }

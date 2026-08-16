@@ -17,7 +17,7 @@ from pypylon import pylon
 from states import motor_state, file_state, ellipse_state, frame_state
 
 TARGET_UI_FPS = 30
-SAVE_EVERY_N_FRAMES = 5  # <----- SAVE 1 OUT OF EVERY 10 FRAMES
+SAVE_EVERY_N_FRAMES = 5
 
 
 # ==============================================================
@@ -150,7 +150,7 @@ def _build_camera_window(parent):
 
             gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
-            _, thresh = cv2.threshold(blur, 50, 255, cv2.THRESH_BINARY)
+            _, thresh = cv2.threshold(blur, 100, 255, cv2.THRESH_BINARY)
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
             if contours:

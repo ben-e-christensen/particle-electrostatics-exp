@@ -17,7 +17,7 @@ from pypylon import pylon
 from states import motor_state, file_state, ellipse_state, frame_state
 
 TARGET_UI_FPS = 30
-SAVE_EVERY_N_FRAMES = 5
+SAVE_EVERY_N_FRAMES = 5000
 
 
 # ==============================================================

@@ -24,11 +24,11 @@ SERIAL_PORT = '/dev/ttyACM0'
 BAUD = 115200
 
 # ===== Public data queues =====
-data_queue_a0: Queue[float] = Queue(maxsize=2000)  # CH2 volts
-data_queue_a1: Queue[float] = Queue(maxsize=2000)  # CH3 volts
+data_queue_a0: Queue[float] = Queue(maxsize=2000)  # electro 1 volts
+data_queue_a1: Queue[float] = Queue(maxsize=2000)  # electro 2 volts
 
 # Optional: latest snapshot others can read without touching queues
-latest = {"seq": 0, "ms": 0, "ch0": 0.0, "ch2": 0.0, "ch3": 0.0}
+latest = {"seq": 0, "ms": 0, "electro1": 0.0, "electro2": 0.0}
 
 # ===== Timer State =====
 timer_state = {
@@ -59,36 +59,24 @@ BLE_LINE_RE = re.compile(
 degrees = 0.0
 
 v_state = {
-    'ch2_prev': 0,
-    'ch3_prev': 0,
+    'electro1_prev': 0,
+    'electro2_prev': 0,
     'record': False
 }
 derivatives = {
-    'ch2': 0,
-    'ch3': 0,
+    'electro1': 0,
+    'electro2': 0,
     'threshold': 1,
-    'ch2_flag': False,
-    'ch3_flag': False,
+    'electro1_flag': False,
+    'electro2_flag': False,
 }
 
 # --- ADC Conversion ---
-def convert_to_voltage(raw, inputRange=4, vREF=4.096):
-    ratio = raw / (1 << 14)
-    if inputRange == 1:
-        return ratio * 3 * vREF / 2 - 1.5 * vREF / 2
-    elif inputRange == 2:
-        return ratio * 3 * vREF / 2 - 3 * vREF / 2
-    elif inputRange == 3:
-        return ratio * 3 * vREF / 2
-    elif inputRange == 4:
-        return ratio * 3 * vREF - 1.5 * vREF
-    elif inputRange == 5:
-        return ratio * 3 * vREF - 3 * vREF
-    elif inputRange == 6:
-        return ratio * 3 * vREF
-    elif inputRange == 7:
-        return ratio * 6 * vREF - 3 * vREF
-    return 0
+ADS_LSB = 4.096 / 32768.0   # 125 uV per count (ADS1115 @ +/-4.096 V PGA)
+
+def convert_to_voltage(raw):
+    """ADS1115 @ +/-4.096V PGA through INA159: V = 5*(Vpin - 1.25)"""
+    return 5.0 * (raw * ADS_LSB - 1.25)
 
 # --- CSV Setup ---
 CSV_PATH = None
@@ -109,9 +97,9 @@ def init_csv():
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow([
         "index","timestamp","seq","ms","motor_angle_deg", "motor_speed",
-        "CH0_volts","CH2_volts","CH3_volts",
+        "electro1_volts","electro2_volts",
         "ellipse_angle_deg", "ellipse_area_px2", "frame_name",
-        "ch2_dv/dt", 'ch3_dv/dt', 'ch2_flag', 'ch3_flag'
+        "electro1_dv/dt", 'electro2_dv/dt', 'electro1_flag', 'electro2_flag'
     ])
 
     csv_index = 0
@@ -167,51 +155,51 @@ def serial_listener_thread():
                 parts = line.split(',')
                 if len(parts) == 5:
                     try:
-                        seq, ms, ch0_raw, ch2_raw, ch3_raw = map(int, parts)
+                        # wire format is still 5 fields; third is a spare slot
+                        seq, ms, _spare, electro1_raw, electro2_raw = map(int, parts)
                     except ValueError:
                         continue
 
                     # Convert to volts
-                    ch0_v = convert_to_voltage(ch0_raw, inputRange=1)
-                    ch2_v = convert_to_voltage(ch2_raw, inputRange=1)
-                    ch3_v = convert_to_voltage(ch3_raw, inputRange=1)
+                    electro1_v = convert_to_voltage(electro1_raw)
+                    electro2_v = convert_to_voltage(electro2_raw)
 
                     if v_state['record']:
                     # compute derivatives
-                        for ch, current_v in (("ch2", ch2_v), ("ch3", ch3_v)):
+                        for ch, current_v in (("electro1", electro1_v), ("electro2", electro2_v)):
                             prev_key = f"{ch}_prev"
                             dv = (current_v - v_state[prev_key]) / 0.01  # 100 Hz → dt = 0.01 s
                             derivatives[ch] = dv
                             derivatives[f"{ch}_flag"] = dv > derivatives["threshold"]
                             # update previous value
                             v_state[prev_key] = current_v
-                        
+
                     else:
                         v_state['record'] = True
-                    
+
                     # Update latest snapshot
                     latest.update({"seq": seq, "ms": ms,
-                                   "ch0": ch0_v, "ch2": ch2_v, "ch3": ch3_v})
+                                   "electro1": electro1_v, "electro2": electro2_v})
 
-                    # Push CH2/CH3 to queues
-                    _q_put_drop_oldest(data_queue_a0, ch2_v)
-                    _q_put_drop_oldest(data_queue_a1, ch3_v)
+                    # Push electro 1/2 to queues
+                    _q_put_drop_oldest(data_queue_a0, electro1_v)
+                    _q_put_drop_oldest(data_queue_a1, electro2_v)
 
                     # Motor angle
                     motor_angle = motor_state.get("angle", 0.0)
                     angle = ellipse_state.get("angle_deg")
                     area  = ellipse_state.get("area_px2")
-                    
+
                     # Write CSV row if motor running
                     if motor_state['running']:
                         ts = time.time()
                         csv_writer.writerow([
                             csv_index, ts, seq, ms, motor_angle, motor_state['rpm'],
-                            f"{ch0_v:.6f}", f"{ch2_v:.6f}", f"{ch3_v:.6f}",
+                            f"{electro1_v:.6f}", f"{electro2_v:.6f}",
                             round(angle, 2) if angle is not None else "",
                             round(area, 1) if area is not None else "",
-                            frame_state['name'], f"{derivatives['ch2']:.6f}", f"{derivatives['ch3']:.6f}",
-                            derivatives['ch2_flag'], derivatives['ch3_flag']
+                            frame_state['name'], f"{derivatives['electro1']:.6f}", f"{derivatives['electro2']:.6f}",
+                            derivatives['electro1_flag'], derivatives['electro2_flag']
                         ])
 
                         csv_file.flush()
@@ -238,6 +226,39 @@ if ser:
     listener_thread.start()
 
 # --- Motor Control Functions ---
+def infinite_cycle_sequence():
+    """1→24 RPM ramping +1 RPM per hold period, then 24→1 back down, looping until stopped."""
+    if not ser:
+        print("[!] No serial connection available.")
+        return
+
+    HOLD_SECONDS = 3600   # <-- testing value; set to 3600 for 1 hour per step
+
+    up = list(range(1, 25))        # 1..24
+    down = list(range(24, 0, -1))  # 24..1
+    cycle = up + down
+
+    motor_state['running'] = True
+    print(f"[CYCLE] Starting ramp cycle, {HOLD_SECONDS}s per step...")
+
+    while motor_state['running']:
+        for rpm in cycle:
+            if not motor_state['running']:
+                break
+            motor_state['rpm'] = rpm
+            update_tkinter_input_box(freq, rpm)
+            sps = (rpm / 60.0) * motor_state['spr']
+            send_command('S', int(sps))
+            update_gui_state()
+            print(f"[CYCLE] Holding {rpm} RPM for {HOLD_SECONDS}s...")
+            for _ in range(HOLD_SECONDS):
+                if not motor_state['running']:
+                    break
+                time.sleep(1)
+
+    send_command('X')
+    print("[CYCLE] Stopped.")
+
 def calculate_speed_sps():
     """Calculates SPS from the current RPM in the GUI."""
     try:
@@ -312,13 +333,13 @@ def start_motor():
     sps_value = calculate_speed_sps()
     motor_state['running'] = True
     send_command('S', int(sps_value))
-    
+
     # 2. Handle Timer Logic
     try:
         h = float(hours_input.get())
     except ValueError:
         h = 0.0
-    
+
     if h > 0:
         # Setup Timer
         duration_sec = h * 3600
@@ -412,17 +433,19 @@ timer_label = tk.Label(root, text="Timer: Idle", font=("Helvetica", 12, "bold"))
 
 input_button = tk.Button(root, text="Apply Speed", command=handle_enter)
 auto_ramp_button = tk.Button(root, text="Auto RPM Ramp", command=lambda: threading.Thread(target=auto_ramp_sequence, daemon=True).start())
-
+cycle_button = tk.Button(
+    root, text="48h Ramp Cycle (Loop)",
+    command=lambda: threading.Thread(target=infinite_cycle_sequence, daemon=True).start()
+)
 
 # Set initial values for entry widgets
 update_tkinter_input_box(freq, motor_state['rpm'])
 update_gui_state()
 
-# Pack widgets
 for w in [start_button, stop_button, reverse_button, speed_up_button,
-          slow_down_button, homing_button, auto_ramp_button,
-          inc_label, inc, freq_label, freq, 
-          timer_input_label, hours_input, timer_label, # Replaced revs with timer
+          slow_down_button, homing_button, auto_ramp_button, cycle_button,
+          inc_label, inc, freq_label, freq,
+          timer_input_label, hours_input, timer_label,
           input_button, result_label]:
     w.pack(pady=5)
 

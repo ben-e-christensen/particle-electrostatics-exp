@@ -19,6 +19,30 @@ from states import motor_state, file_state, ellipse_state, frame_state
 TARGET_UI_FPS = 30
 SAVE_EVERY_N_FRAMES = 5000
 
+# ==============================================================
+# Live-feed pause/resume (so burst capture can borrow the camera)
+# ==============================================================
+# Only one process can hold the Basler camera. A burst run asks the live
+# grabber to release it with pause_live_feed(), opens the camera itself, and
+# calls resume_live_feed() when done. The grabber reopens the camera on resume.
+_pause_event = threading.Event()      # set  -> grabber must release the camera
+_released_event = threading.Event()   # set  -> grabber has released it
+_grabber_ref = {"grabber": None}
+
+
+def pause_live_feed(timeout: float = 10.0) -> bool:
+    """Ask the live grabber to close the camera. Returns True once released
+    (or immediately if no live grabber is running)."""
+    g = _grabber_ref["grabber"]
+    _pause_event.set()
+    if g is None or not g.is_alive() or g.err:
+        return True
+    return _released_event.wait(timeout)
+
+
+def resume_live_feed():
+    _pause_event.clear()
+
 
 # ==============================================================
 # Camera Thread
@@ -31,36 +55,63 @@ class CameraGrabber(threading.Thread):
         self.cam = None
         self.converter = None
         self.err = None
+        self.paused = False
+
+    def _open(self):
+        tl = pylon.TlFactory.GetInstance()
+        devs = tl.EnumerateDevices()
+        if not devs:
+            raise RuntimeError("No Basler cameras found.")
+
+        self.cam = pylon.InstantCamera(tl.CreateFirstDevice())
+        self.cam.Open()
+        print("[camera_feed_gui] Opened:", self.cam.GetDeviceInfo().GetModelName())
+
+        self.cam.GainAuto.SetValue("Off")
+        self.cam.Gain.SetValue(28.0)
+
+        syms = self.cam.PixelFormat.GetSymbolics()
+        self.cam.PixelFormat.SetValue(syms[0])
+        print("[camera_feed_gui] Using PixelFormat:", self.cam.PixelFormat.GetValue())
+
+        self.converter = pylon.ImageFormatConverter()
+        if "Mono" in self.cam.PixelFormat.GetValue():
+            self.converter.OutputPixelFormat = pylon.PixelType_Mono8
+        else:
+            self.converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+        self.converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+
+        self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+
+    def _close(self):
+        try:
+            if self.cam:
+                if self.cam.IsGrabbing():
+                    self.cam.StopGrabbing()
+                if self.cam.IsOpen():
+                    self.cam.Close()
+        except Exception:
+            pass
+        self.cam = None
 
     def run(self):
+        _grabber_ref["grabber"] = self
         try:
-            tl = pylon.TlFactory.GetInstance()
-            devs = tl.EnumerateDevices()
-            if not devs:
-                self.err = "No Basler cameras found."
-                return
+            while not self.stop_event.is_set():
+                # --- paused: camera released, wait for resume ---
+                if _pause_event.is_set():
+                    self._close()
+                    self.paused = True
+                    _released_event.set()
+                    while _pause_event.is_set() and not self.stop_event.is_set():
+                        time.sleep(0.1)
+                    _released_event.clear()
+                    self.paused = False
+                    continue
 
-            self.cam = pylon.InstantCamera(tl.CreateFirstDevice())
-            self.cam.Open()
-            print("[camera_feed_gui] Opened:", self.cam.GetDeviceInfo().GetModelName())
+                if self.cam is None:
+                    self._open()
 
-            self.cam.GainAuto.SetValue("Off")
-            self.cam.Gain.SetValue(28.0)
-
-            syms = self.cam.PixelFormat.GetSymbolics()
-            self.cam.PixelFormat.SetValue(syms[0])
-            print("[camera_feed_gui] Using PixelFormat:", self.cam.PixelFormat.GetValue())
-
-            self.converter = pylon.ImageFormatConverter()
-            if "Mono" in self.cam.PixelFormat.GetValue():
-                self.converter.OutputPixelFormat = pylon.PixelType_Mono8
-            else:
-                self.converter.OutputPixelFormat = pylon.PixelType_BGR8packed
-            self.converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
-
-            self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-
-            while not self.stop_event.is_set() and self.cam.IsGrabbing():
                 grab = self.cam.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
                 if grab.GrabSucceeded():
                     img = self.converter.Convert(grab).GetArray()
@@ -72,16 +123,10 @@ class CameraGrabber(threading.Thread):
 
         except Exception as e:
             self.err = f"{type(e).__name__}: {e}"
+            _released_event.set()   # never leave a pause_live_feed() caller hanging
 
         finally:
-            try:
-                if self.cam:
-                    if self.cam.IsGrabbing():
-                        self.cam.StopGrabbing()
-                    if self.cam.IsOpen():
-                        self.cam.Close()
-            except Exception:
-                pass
+            self._close()
 
 
 # ==============================================================
@@ -205,6 +250,8 @@ def _build_camera_window(parent):
         # Update text
         if grabber.err:
             info.config(text=f"[!] {grabber.err}")
+        elif grabber.paused:
+            info.config(text="Paused (camera in use by burst capture)")
         else:
             info.config(text="Streaming…")
 

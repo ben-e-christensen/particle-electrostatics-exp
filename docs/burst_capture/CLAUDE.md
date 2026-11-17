@@ -1,19 +1,23 @@
-# Burst Capture Run — Design Notes (in progress, nothing implemented yet)
+# Burst Capture Run — Design Notes
 
-This is a new automated run mode. While the motor spins, the Basler camera takes
-high-frame-rate image bursts in RAM, then writes them to disk.
-This file records what has been decided and what is still open. **Resolve the open
-questions with the user before writing code.** The user asked for this explicitly:
-"clear up any uncertainties before just writing a shit load of code that doesn't do
-what I actually want."
+Automated run mode: the motor spins at a fixed speed while the Basler camera takes
+high-frame-rate image bursts into RAM, then writes them to disk losslessly.
+First implementation landed 2026-11-16; **not yet tested on the real hardware**.
 
-## Goal
+## What exists
 
-- Run the motor at set speeds and capture image bursts sized by **revolutions**, not
-  by how much fills RAM.
-- **1 frame per degree of rotation**, so the camera frame rate depends on speed:
-  `fps = 6 × RPM` (RPM × 360° / 60 s). Each rev = 360 frames.
-- More revs are captured at higher speeds so every burst lasts a similar time:
+| File | Role |
+|---|---|
+| `burst_capture.py` | Shared library: `revs_for_rpm`, `burst_plan`, `BurstCamera` (open, set fps, grab into a preallocated array), `save_burst` (PNG + `frames.csv` + `burst_info.json`), `check_disk_space`, `frame_stats`. |
+| `gui/motor_controls_gui.py` | **"Burst Run" button** → `burst_run_sequence()`. Also now parses the bare-float angle lines from the ESP32 into `motor_state['angle']`. |
+| `gui/camera_feed_gui.py` | `pause_live_feed()` / `resume_live_feed()` so a burst can borrow the camera. The grabber closes the camera on pause and reopens it on resume. |
+| `burst_test.py` | Standalone camera-settings test (owns serial + camera; close the GUI first). |
+
+## Decisions (all confirmed with the user)
+
+- **Sampling: 1 frame per degree.** `fps = 6 × RPM`, 360 frames per rev.
+- **Revs per burst** from this table, **rounded to the nearest RPM row**
+  (so 13 RPM → 3 revs, 40 RPM → 6 revs):
 
 | RPM | Revs | FPS | Duration | Frames | 1920×1200 Mono8 | 1280×1024 | 640×480 |
 |---|---|---|---|---|---|---|---|
@@ -23,83 +27,62 @@ what I actually want."
 | 16 | 4 | 96  | 15.0 s | 1,440 | 3.3 GB  | 1.9 GB  | 0.44 GB |
 | 21 | 5 | 126 | 14.3 s | 1,800 | 4.1 GB  | 2.4 GB  | 0.55 GB |
 | 26 | 6 | 156 | 13.8 s | 2,160 | 5.0 GB  | 2.8 GB  | 0.66 GB |
-| **Total** | | | | **7,560** | **17 GB** | **9.9 GB** | **2.3 GB** |
 
-Speeds are assumed from `auto_ramp_sequence` (1, 6, 11, 16, 21, 26). The pattern is
-n revs at 5n−4 RPM. Confirm this, and the upper limit (the infinite cycle goes to 24).
+- **Main run structure:** a button in the existing GUI. It uses **whatever RPM is in
+  the GUI box**, runs the motor for **1 hour**, takes a burst **every 10 minutes**
+  (t = 0, 10, …, 60 min → 7 bursts, after a 5 s settle), then stops the motor.
+  Constants: `BURST_RUN_HOURS`, `BURST_INTERVAL_MIN`, `BURST_SETTLE_S` in
+  `motor_controls_gui.py`. "Stop Motor" interrupts the run (and an in-progress burst).
+- **Test script is standalone** (`burst_test.py`): steps through 1, 6, 11, 16, 21, 26
+  RPM, 5 s settle each, **one full revolution per speed**, saves **150 evenly spaced
+  frames per speed** plus `summary.csv` (achieved fps, block-id gaps, brightness
+  mean/saturation, save time). Exposure/gain/ROI are CLI flags so it can be iterated
+  to choose the settings for the real run. ~6 min total (dominated by the 60 s rev at 1 RPM).
+- **Don't fill RAM.** Burst size is fixed by revs; the largest burst (~5 GB at full res)
+  fits the 16 GB machine. The buffer is preallocated with `np.empty`.
+- **Save lossless** PNG (`cv2.imwrite`, compression level 1) via a thread pool. Saving is
+  synchronous in the sequence thread and must finish before the next burst (10 min apart,
+  so plenty of slack). The electrometer CSV keeps logging throughout.
+- **Camera free-runs** at `AcquisitionFrameRate = 6 × RPM`, no hardware trigger
+  (25,600 steps/rev = 71.1 steps/degree, not a whole number). Each frame's row in
+  `frames.csv` has: frame index, camera timestamp, block id, PC time, motor angle (and
+  when that angle was last received), RPM. Sync with `experiment_log.csv` by PC time.
+- **Disk check** before the run: refuses if free < 1.2 × (raw bytes of all planned bursts).
+- Exposure: fixed. `BurstCamera.set_fps` clamps exposure to 90 % of the frame period if
+  it is too long for the requested fps. Default exposure is the camera default (`EXPOSURE_US = None`
+  in `burst_capture.py`); set it there once the test script shows what works.
 
-## How we got here
+## Output layout
 
-1. First idea: one hour at a fixed speed, and every ~5 min a burst at 200 fps that
-   fills as much RAM as possible (16 GB machine; a 32 GB one is available).
-2. The user then said 200 fps is overkill, and that a fixed burst length makes no
-   sense across speeds (2 revs at 1 RPM takes 2 min). Considered next: 50 fps at
-   1 RPM and 100 fps at ≥6 RPM. That gives uneven angular resolution (0.12°/frame at
-   1 RPM vs 1.56°/frame at 26 RPM).
-3. **Settled on 1 frame per degree**, so every speed has the same angular sampling.
+```
+<CURRENT_DIR>/bursts/burst_03_t030min_rpm6/
+    frame_000000.png … frames.csv  burst_info.json
+<BASE_DIR>/burst_test_<time>/rpm06/…  summary.csv  args.json
+```
 
-## Decisions already made
+## Known gaps / things to verify on the hardware
 
-- **Don't fill RAM until the machine runs out.** That causes swapping, dropped
-  frames or the OOM killer. Burst size is now set by revs, and the largest burst
-  is ~5 GB, which fits on the 16 GB machine.
-- **Save lossless** (raw `.npy` or PNG/TIFF), not JPEG. The current
-  `camera_feed_gui.py` saves JPEG, which is lossy and unsuitable for analysis.
-- **The camera runs on its own clock** at `AcquisitionFrameRate = 6 × RPM`, not
-  triggered by the motor, so frames are only approximately 1 per degree. Log a
-  per-frame CSV: frame index, camera hardware timestamp, PC time, motor angle and
-  RPM, so each frame can be mapped to its real angle and synced with the
-  electrometer CSV. A hardware trigger from the ESP32 was considered and set
-  aside: 25,600 steps/rev gives 71.1 steps/degree, which isn't a whole number.
+- `pypylon` node access (`GetNodeMap().GetNode(...)`, `genicam.IsAvailable`,
+  USB vs GigE names `AcquisitionFrameRate`/`...Abs`, `ExposureTime`/`...Abs`) was written
+  from the pylon API docs and could not be run here (no camera, no pypylon on this PC).
+  Run `burst_test.py --no-motor` first to shake this out.
+- **Firmware angle mismatch:** `client/client.ino` computes the printed degrees with
+  `stepsPerRev = 6400`, but Python sends speed using `spr = 25600`. If the driver really
+  is at 25600 microsteps/rev the reported angle wraps 4× per revolution. Fix in firmware
+  (or divide by 4) before trusting `motor_angle_deg`.
+- Angle arrives only every 500 ms, so at 26 RPM it is ~78° stale at worst. Use camera
+  timestamps + known RPM for fine angle; the logged angle is for coarse alignment.
+- Camera model/resolution still unknown; `burst_test.py` prints them and whether 156 fps
+  is reachable (`ResultingFrameRate` warning).
+- Disk write speed on the original machine (`/dev/sda2`, possibly HDD) — `summary.csv`
+  `save_s` column shows it.
+- The 16 GB machine has ~12 GB available; the 5 GB burst plus the live-feed process is fine,
+  but don't run two bursts' worth of buffers at once.
 
-## Open questions (ask the user)
+## Constraints from the existing code (unchanged)
 
-1. **Run structure.** How does the per-speed burst fit into a run?
-   - (a) One hour per speed, a burst every 5 min (13 bursts). Multiply that
-     speed's row by 13; for example, an hour at 26 RPM at full res is ~65 GB.
-   - (b) One pass through the ramp, one burst per speed (~17 GB at full res).
-   - (c) Something else, such as the 1→24→1 `infinite_cycle_sequence` with a burst
-     at each step.
-   - If there are multiple bursts at a speed, should the bursts start at fixed
-     times (t = 0, 5, 10 … min)? That was suggested and not yet confirmed.
-2. **Camera model and resolution / ROI.** Unknown so far; `pypylon` is not in the
-   system Python on the original machine (probably a venv). This sets the real
-   GB per frame and whether 156 fps is possible at that resolution.
-3. **Exposure.** At 156 fps exposure must be < ~6.4 ms. Gain is already 28 dB in
-   `camera_feed_gui.py`, which suggests dim lighting. Will frames be bright enough?
-   Motion blur in degrees is (6 × RPM) × exposure; at 26 RPM with 5 ms that is
-   ~0.8°. Option: scale exposure with speed so blur stays constant, but brightness
-   then changes and gain would need compensating. The default is fixed exposure
-   unless the user wants scaling.
-4. **More revs per speed?** RAM is no longer the limit, so more revs could be
-   captured for better statistics.
-5. **Separate script or a GUI mode?** Recommended: a "Burst Run" button in the
-   existing GUI (see constraints below), with the live preview paused during each
-   burst.
-
-## Constraints from the existing code
-
-- Only **one process can open the Basler camera**. `gui/camera_feed_gui.py`
-  (`CameraGrabber`, which uses `GrabStrategy_LatestImageOnly`) holds it while the
-  GUI runs. A burst mode either has to take over that grabber (stop it, change
-  `AcquisitionFrameRate`, grab with `GrabStrategy_OneByOne` into a preallocated
-  numpy array, then hand the camera back) or run as a standalone script without
-  the GUI.
-- `gui/motor_controls_gui.py` owns the **only serial connection** to the ESP32:
-  motor commands via `send_command('S', sps)` / `send_command('X')`, and
-  electrometer samples written to the CSV by `serial_listener_thread`.
-  `sps = rpm / 60 × motor_state['spr']` (spr = 25600). Existing automated
-  sequences to copy from: `auto_ramp_sequence`, `infinite_cycle_sequence`.
-- Motor angle is in `motor_state['angle']`. Output directory is
-  `file_state['CURRENT_DIR']`, set in `main.py` to `~/Desktop/<date_time>/`.
-- Frames must finish writing to disk before the next burst (or before the next
-  speed step, if that comes sooner). Preallocate the burst buffer and do the
-  compression/saving in a separate thread or process pool so grabbing never stalls.
-
-## Hardware notes
-
-- Original machine: 16 GB RAM (~12 GB available), **~94 GB free disk** (90% full,
-  on `/dev/sda2`, which may be an HDD; check write speed). A 32 GB machine is
-  also available.
-- Check free disk space before the run and refuse to start if the planned total
-  won't fit.
+- Only one process can open the camera; the live grabber must be paused (done automatically
+  by `burst_run_sequence`). `burst_test.py` requires the GUI to be closed.
+- `gui/motor_controls_gui.py` owns the only serial connection: `send_command('S', sps)` /
+  `send_command('X')`, `sps = rpm / 60 × 25600`.
+- Output directory is `file_state['CURRENT_DIR']` = `~/Desktop/<date_time>/`.

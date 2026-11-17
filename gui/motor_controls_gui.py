@@ -206,7 +206,17 @@ def serial_listener_thread():
                         csv_index += 1
                         continue
 
-            # 2) Handle markers
+            # 2) Motor angle: firmware prints a bare float (degrees) every 500 ms
+            #    while the motor runs.
+            if not line.startswith('[') and ',' not in line:
+                try:
+                    motor_state['angle'] = float(line)
+                    motor_state['angle_time'] = time.time()
+                    continue
+                except ValueError:
+                    pass
+
+            # 3) Handle markers
             if line == "PROBE_LOW":
                 print("[EVENT] Probe activated!")
             elif line == "RUNNING":
@@ -401,6 +411,125 @@ def auto_ramp_sequence():
     motor_state['running'] = False
 
 
+# --- Burst Run: fixed RPM for BURST_RUN_HOURS, image burst every BURST_INTERVAL_MIN ---
+BURST_RUN_HOURS = 1.0
+BURST_INTERVAL_MIN = 10.0
+BURST_SETTLE_S = 5.0        # let the motor reach speed before the first burst
+
+def _set_burst_status(text, color="black"):
+    root.after(0, lambda: burst_label.config(text=text, fg=color))
+
+def burst_run_sequence():
+    """Run the motor at the GUI's RPM for one hour, taking a burst of
+    1-frame-per-degree images every 10 minutes (t = 0, 10, ..., 60 min)."""
+    import burst_capture as bc
+    from gui.camera_feed_gui import pause_live_feed, resume_live_feed
+
+    if not ser:
+        print("[!] No serial connection available.")
+        return
+    if motor_state['running']:
+        print("[BURST] Motor already running; stop it first.")
+        return
+    try:
+        rpm = float(freq.get())
+    except ValueError:
+        print("[BURST] Invalid RPM value.")
+        return
+
+    plan = bc.burst_plan(rpm)
+    interval_s = BURST_INTERVAL_MIN * 60.0
+    n_bursts = int(BURST_RUN_HOURS * 3600 // interval_s) + 1
+    base_dir = os.path.join(file_state["CURRENT_DIR"], "bursts")
+    print(f"[BURST] {rpm} RPM: {plan['revs']} rev(s) = {plan['n_frames']} frames at "
+          f"{plan['fps']:.1f} fps ({plan['duration_s']:.1f}s) x {n_bursts} bursts")
+
+    # --- open the camera once to learn the frame size, then check disk ---
+    _set_burst_status("Burst: checking camera/disk…", "blue")
+    if not pause_live_feed():
+        _set_burst_status("Burst: live feed did not release camera", "red")
+        return
+    try:
+        with bc.BurstCamera() as cam:
+            frame_bytes = cam.bytes_per_frame()
+            settings = cam.current_settings()
+    except Exception as e:
+        resume_live_feed()
+        _set_burst_status(f"Burst: camera error: {e}", "red")
+        print(f"[BURST] Camera error: {e}")
+        return
+    resume_live_feed()
+
+    needed = frame_bytes * plan['n_frames'] * n_bursts   # PNG is smaller; be conservative
+    ok, free = bc.check_disk_space(base_dir, needed)
+    print(f"[BURST] Need ~{needed/1e9:.1f} GB (raw), {free/1e9:.1f} GB free")
+    if not ok:
+        _set_burst_status(f"Burst: not enough disk ({free/1e9:.1f} GB free, need {needed/1e9*1.2:.1f})", "red")
+        return
+
+    # --- start the motor ---
+    motor_state['rpm'] = rpm
+    sps = (rpm / 60.0) * motor_state['spr']
+    motor_state['running'] = True
+    send_command('S', int(sps))
+    update_gui_state()
+    time.sleep(BURST_SETTLE_S)
+    t0 = time.time()
+    t_end = t0 + BURST_RUN_HOURS * 3600.0
+
+    def meta_fn():
+        return {"motor_angle_deg": motor_state.get("angle", ""),
+                "motor_angle_time": motor_state.get("angle_time", ""),
+                "rpm": motor_state['rpm']}
+
+    def aborted():
+        return not motor_state['running']
+
+    for k in range(n_bursts):
+        t_target = t0 + k * interval_s
+        while time.time() < t_target:
+            if aborted():
+                break
+            rem = t_target - time.time()
+            _set_burst_status(f"Burst {k}/{n_bursts-1} in {int(rem)//60}:{int(rem)%60:02d}", "blue")
+            time.sleep(1)
+        if aborted():
+            break
+
+        _set_burst_status(f"Burst {k}: capturing {plan['n_frames']} frames…", "red")
+        out_dir = os.path.join(base_dir, f"burst_{k:02d}_t{int(k*BURST_INTERVAL_MIN):03d}min_rpm{rpm:g}")
+        if not pause_live_feed():
+            print("[BURST] Live feed did not release the camera; skipping burst.")
+            continue
+        try:
+            with bc.BurstCamera() as cam:
+                frames, meta = cam.capture_burst(plan['fps'], plan['n_frames'],
+                                                 meta_fn=meta_fn, should_abort=aborted)
+        except Exception as e:
+            print(f"[BURST] Capture error: {e}")
+            resume_live_feed()
+            continue
+        resume_live_feed()
+
+        _set_burst_status(f"Burst {k}: saving {len(frames)} frames…", "orange")
+        info = {"burst": k, "t_min": k * BURST_INTERVAL_MIN, "plan": plan,
+                "camera": settings, "start_pc_time": meta[0]["pc_time"] if meta else None}
+        bc.save_burst(frames, meta, out_dir, info)
+        del frames
+
+    # --- hold the remaining time, then stop ---
+    while time.time() < t_end and not aborted():
+        rem = t_end - time.time()
+        _set_burst_status(f"Burst run: {int(rem)//60}:{int(rem)%60:02d} left (no more bursts)", "blue")
+        time.sleep(1)
+
+    was_aborted = aborted()
+    stop_motor()
+    _set_burst_status("Burst run: interrupted" if was_aborted else "Burst run: DONE",
+                      "red" if was_aborted else "green")
+    print("[BURST] Interrupted." if was_aborted else "[BURST] Run complete. Motor stopped.")
+
+
 # --- GUI Creation ---
 root = tk.Tk()
 root.title("Motor Control & BLE Monitor")
@@ -437,6 +566,11 @@ cycle_button = tk.Button(
     root, text="48h Ramp Cycle (Loop)",
     command=lambda: threading.Thread(target=infinite_cycle_sequence, daemon=True).start()
 )
+burst_button = tk.Button(
+    root, text=f"Burst Run ({BURST_RUN_HOURS:g} hr @ box RPM, burst every {BURST_INTERVAL_MIN:g} min)",
+    command=lambda: threading.Thread(target=burst_run_sequence, daemon=True).start()
+)
+burst_label = tk.Label(root, text="Burst: Idle", font=("Helvetica", 10))
 
 # Set initial values for entry widgets
 update_tkinter_input_box(freq, motor_state['rpm'])
@@ -444,6 +578,7 @@ update_gui_state()
 
 for w in [start_button, stop_button, reverse_button, speed_up_button,
           slow_down_button, homing_button, auto_ramp_button, cycle_button,
+          burst_button, burst_label,
           inc_label, inc, freq_label, freq,
           timer_input_label, hours_input, timer_label,
           input_button, result_label]:
